@@ -3,6 +3,8 @@
 #include "state.hpp"
 #include "submission.hpp"
 
+static Move g_prev_best_move;
+static uint64_t g_prev_hash = 0;
 
 /*============================================================
  * Submission — eval_ctx (Alpha-Beta Pruning)
@@ -54,26 +56,43 @@ int Submission::eval_ctx(
         return score;
     }
 
-    /* === Alpha-Beta loop === */
+    /* === Alpha-Beta loop with PVS === */
     int best_score = M_MAX;
+    bool first = true;
 
     for(auto& action : state->legal_actions){
         State* next = state->next_state(action);
         bool same = next->same_player_as_parent();
 
         int score;
-        if(same){
-            // If the next turn is ours (e.g. multi-step moves, not standard in minichess but supported), 
-            // the perspective is the same, so we pass alpha and beta directly.
-            score = eval_ctx(next, depth - 1, alpha, beta, history, ply + 1, ctx, p);
+        if(first){
+            // First move: full window
+            if(same){
+                score = eval_ctx(next, depth - 1, alpha, beta, history, ply + 1, ctx, p);
+            } else {
+                score = -eval_ctx(next, depth - 1, -beta, -alpha, history, ply + 1, ctx, p);
+            }
+            first = false;
         } else {
-            // Usually, the next turn belongs to the opponent. 
-            // We pass -beta as their alpha, and -alpha as their beta.
-            // Also, we invert the returned score to fit our perspective.
-            score = -eval_ctx(next, depth - 1, -beta, -alpha, history, ply + 1, ctx, p);
+            // Subsequent moves: zero window search
+            if(same){
+                score = eval_ctx(next, depth - 1, alpha, alpha + 1, history, ply + 1, ctx, p);
+                if(score > alpha && score < beta){
+                    // Failed high, re-search with full window
+                    score = eval_ctx(next, depth - 1, alpha, beta, history, ply + 1, ctx, p);
+                }
+            } else {
+                score = -eval_ctx(next, depth - 1, -alpha - 1, -alpha, history, ply + 1, ctx, p);
+                if(score > alpha && score < beta){
+                    // Failed high, re-search with full window
+                    score = -eval_ctx(next, depth - 1, -beta, -alpha, history, ply + 1, ctx, p);
+                }
+            }
         }
 
         delete next;
+
+        if(ctx.stop) break;
 
         if(score > best_score){
             best_score = score;
@@ -122,18 +141,49 @@ SearchResult Submission::search(
     int alpha = M_MAX;
     int beta = P_MAX;
 
+    // Iterative Deepening Move Ordering
+    if(g_prev_hash == state->hash()){
+        auto it = std::find(state->legal_actions.begin(), state->legal_actions.end(), g_prev_best_move);
+        if(it != state->legal_actions.end()){
+            std::swap(state->legal_actions[0], *it);
+        }
+    }
+
+    bool first = true;
+
     for(auto& action : state->legal_actions){
         State* next = state->next_state(action);
         bool same = next->same_player_as_parent();
 
         int score;
-        if(same){
-            score = eval_ctx(next, depth - 1, alpha, beta, history, 1, ctx, p);
+        if(first){
+            // First move: full window
+            if(same){
+                score = eval_ctx(next, depth - 1, alpha, beta, history, 1, ctx, p);
+            } else {
+                score = -eval_ctx(next, depth - 1, -beta, -alpha, history, 1, ctx, p);
+            }
+            first = false;
         } else {
-            score = -eval_ctx(next, depth - 1, -beta, -alpha, history, 1, ctx, p);
+            // Subsequent moves: zero window search
+            if(same){
+                score = eval_ctx(next, depth - 1, alpha, alpha + 1, history, 1, ctx, p);
+                if(score > alpha && score < beta){
+                    // Failed high, re-search with full window
+                    score = eval_ctx(next, depth - 1, alpha, beta, history, 1, ctx, p);
+                }
+            } else {
+                score = -eval_ctx(next, depth - 1, -alpha - 1, -alpha, history, 1, ctx, p);
+                if(score > alpha && score < beta){
+                    // Failed high, re-search with full window
+                    score = -eval_ctx(next, depth - 1, -beta, -alpha, history, 1, ctx, p);
+                }
+            }
         }
 
         delete next;
+
+        if(ctx.stop) break;
 
         if(score > best_score){
             best_score = score;
@@ -152,7 +202,15 @@ SearchResult Submission::search(
         move_index++;
     }
 
+    if(!ctx.stop){
+        g_prev_best_move = result.best_move;
+        g_prev_hash = state->hash();
+    }
+
     result.score = best_score;
+    if(result.best_move.first != result.best_move.second) {
+        result.pv.push_back(result.best_move);
+    }
     return result;
 } 
 

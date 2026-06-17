@@ -27,7 +27,8 @@ public:
         GameHistory& history,
         int ply,
         SearchContext& ctx,
-        const SubParams& p
+        const SubParams& p,
+        bool allow_null = true
     );
     
     static SearchResult search(

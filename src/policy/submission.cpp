@@ -130,7 +130,8 @@ int Submission::eval_ctx(
     GameHistory& history,
     int ply,
     SearchContext& ctx,
-    const SubParams& p
+    const SubParams& p,
+    bool allow_null
 ){
     ctx.nodes++;
     if(ply > ctx.seldepth){
@@ -182,6 +183,30 @@ int Submission::eval_ctx(
         }
     }
 
+    /* === Null Move Pruning === */
+    bool has_non_king = false;
+    for(int r = 0; r < BOARD_H; r++){
+        for(int c = 0; c < BOARD_W; c++){
+            int pc = state->piece_at(state->player, r, c);
+            if(pc >= 1 && pc <= 5){
+                has_non_king = true;
+                break;
+            }
+        }
+        if(has_non_king) break;
+    }
+
+    if(allow_null && depth >= 3 && has_non_king){
+        State* null_state = dynamic_cast<State*>(state->create_null_state());
+        if(null_state){
+            int score = -eval_ctx(null_state, depth - 1 - 2, -beta, -beta + 1, history, ply + 1, ctx, p, false);
+            delete null_state;
+            if(score >= beta && !ctx.stop){
+                return score;
+            }
+        }
+    }
+
     history.push(hash);
 
     if(depth <= 0){
@@ -230,6 +255,7 @@ int Submission::eval_ctx(
         return get_move_score(a) > get_move_score(b);
     });
 
+    int move_count = 0;
     for(auto& action : state->legal_actions){
         State* next = state->next_state(action);
         bool same = next->same_player_as_parent();
@@ -238,24 +264,44 @@ int Submission::eval_ctx(
         if(first){
             // First move: full window
             if(same){
-                score = eval_ctx(next, depth - 1, alpha, beta, history, ply + 1, ctx, p);
+                score = eval_ctx(next, depth - 1, alpha, beta, history, ply + 1, ctx, p, true);
             } else {
-                score = -eval_ctx(next, depth - 1, -beta, -alpha, history, ply + 1, ctx, p);
+                score = -eval_ctx(next, depth - 1, -beta, -alpha, history, ply + 1, ctx, p, true);
             }
             first = false;
         } else {
-            // Subsequent moves: zero window search
+            // Subsequent moves: check LMR
+            int reduction = 0;
+            int victim = state->piece_at(1 - state->player, action.second.first, action.second.second);
+            int attacker = state->piece_at(state->player, action.first.first, action.first.second);
+            bool is_capture = (victim != 0);
+            bool is_promotion = (attacker == 1 && (action.second.first == BOARD_H - 1 || action.second.first == 0));
+            bool is_killer = (ply < MAX_PLY && (action == g_killers[0][ply] || action == g_killers[1][ply]));
+
+            if (depth >= 3 && move_count >= 3 && !is_capture && !is_promotion && !is_killer) {
+                reduction = 1;
+                if (depth >= 6 && move_count >= 8) {
+                    reduction = 2;
+                }
+            }
+
+            int reduced_depth = std::max(0, depth - 1 - reduction);
+
             if(same){
-                score = eval_ctx(next, depth - 1, alpha, alpha + 1, history, ply + 1, ctx, p);
+                score = eval_ctx(next, reduced_depth, alpha, alpha + 1, history, ply + 1, ctx, p, true);
+                if(score > alpha && reduction > 0){
+                    score = eval_ctx(next, depth - 1, alpha, alpha + 1, history, ply + 1, ctx, p, true);
+                }
                 if(score > alpha && score < beta){
-                    // Failed high, re-search with full window
-                    score = eval_ctx(next, depth - 1, alpha, beta, history, ply + 1, ctx, p);
+                    score = eval_ctx(next, depth - 1, alpha, beta, history, ply + 1, ctx, p, true);
                 }
             } else {
-                score = -eval_ctx(next, depth - 1, -alpha - 1, -alpha, history, ply + 1, ctx, p);
+                score = -eval_ctx(next, reduced_depth, -alpha - 1, -alpha, history, ply + 1, ctx, p, true);
+                if(score > alpha && reduction > 0){
+                    score = -eval_ctx(next, depth - 1, -alpha - 1, -alpha, history, ply + 1, ctx, p, true);
+                }
                 if(score > alpha && score < beta){
-                    // Failed high, re-search with full window
-                    score = -eval_ctx(next, depth - 1, -beta, -alpha, history, ply + 1, ctx, p);
+                    score = -eval_ctx(next, depth - 1, -beta, -alpha, history, ply + 1, ctx, p, true);
                 }
             }
         }
@@ -290,6 +336,7 @@ int Submission::eval_ctx(
             }
             break;
         }
+        move_count++;
     }
 
     /* === Store in Transposition Table === */
@@ -393,24 +440,43 @@ SearchResult Submission::search(
         if(first){
             // First move: full window
             if(same){
-                score = eval_ctx(next, depth - 1, alpha, beta, history, 1, ctx, p);
+                score = eval_ctx(next, depth - 1, alpha, beta, history, 1, ctx, p, true);
             } else {
-                score = -eval_ctx(next, depth - 1, -beta, -alpha, history, 1, ctx, p);
+                score = -eval_ctx(next, depth - 1, -beta, -alpha, history, 1, ctx, p, true);
             }
             first = false;
         } else {
-            // Subsequent moves: zero window search
+            // Subsequent moves: check LMR
+            int reduction = 0;
+            int victim = state->piece_at(1 - state->player, action.second.first, action.second.second);
+            int attacker = state->piece_at(state->player, action.first.first, action.first.second);
+            bool is_capture = (victim != 0);
+            bool is_promotion = (attacker == 1 && (action.second.first == BOARD_H - 1 || action.second.first == 0));
+
+            if (depth >= 3 && move_index >= 3 && !is_capture && !is_promotion) {
+                reduction = 1;
+                if (depth >= 6 && move_index >= 8) {
+                    reduction = 2;
+                }
+            }
+
+            int reduced_depth = std::max(0, depth - 1 - reduction);
+
             if(same){
-                score = eval_ctx(next, depth - 1, alpha, alpha + 1, history, 1, ctx, p);
+                score = eval_ctx(next, reduced_depth, alpha, alpha + 1, history, 1, ctx, p, true);
+                if(score > alpha && reduction > 0){
+                    score = eval_ctx(next, depth - 1, alpha, alpha + 1, history, 1, ctx, p, true);
+                }
                 if(score > alpha && score < beta){
-                    // Failed high, re-search with full window
-                    score = eval_ctx(next, depth - 1, alpha, beta, history, 1, ctx, p);
+                    score = eval_ctx(next, depth - 1, alpha, beta, history, 1, ctx, p, true);
                 }
             } else {
-                score = -eval_ctx(next, depth - 1, -alpha - 1, -alpha, history, 1, ctx, p);
+                score = -eval_ctx(next, reduced_depth, -alpha - 1, -alpha, history, 1, ctx, p, true);
+                if(score > alpha && reduction > 0){
+                    score = -eval_ctx(next, depth - 1, -alpha - 1, -alpha, history, 1, ctx, p, true);
+                }
                 if(score > alpha && score < beta){
-                    // Failed high, re-search with full window
-                    score = -eval_ctx(next, depth - 1, -beta, -alpha, history, 1, ctx, p);
+                    score = -eval_ctx(next, depth - 1, -beta, -alpha, history, 1, ctx, p, true);
                 }
             }
         }

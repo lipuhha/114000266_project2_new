@@ -152,11 +152,15 @@ int State::evaluate(
         // you can calculate mobility by legal actions size
         // bonus += 2 * (self_mobility - oppn_mobility);
         int self_mobility = this->legal_actions.size();
-        State* null_state = (State*)this->create_null_state();
-        int oppn_mobility = null_state->legal_actions.size();
-        delete null_state;
+        int oppn_mobility = 0;
+#ifdef USE_BITBOARD
+        oppn_mobility = count_legal_actions_bitboard(1 - this->player);
+#else
+        State null_state(this->board, 1 - this->player);
+        null_state.get_legal_actions();
+        oppn_mobility = null_state.legal_actions.size();
+#endif
         bonus += 2 * (self_mobility - oppn_mobility);
-
     }
 
     return self_score - oppn_score + bonus;
@@ -652,6 +656,123 @@ void State::get_legal_actions_bitboard(){
                 Move(Point(r, c), Point(BB_ROW(to), BB_COL(to))));
         }
     }
+}
+
+int State::count_legal_actions_bitboard(int self) const {
+    if(!bb_ready){
+        bb_init();
+    }
+
+    int oppn = 1 - self;
+
+    // Build occupancy bitmasks and piece-type lookup
+    uint32_t self_occ = 0, oppn_occ = 0;
+    int self_pt[30] = {};  // piece type at each square (self)
+    int oppn_pt[30] = {};  // piece type at each square (opponent)
+
+    for(int r = 0; r < BOARD_H; r++){
+        for(int c = 0; c < BOARD_W; c++){
+            int sq = BB_SQ(r, c);
+            if(this->board.board[self][r][c]){
+                self_occ |= 1u << sq;
+                self_pt[sq] = this->board.board[self][r][c];
+            }
+            if(this->board.board[oppn][r][c]){
+                oppn_occ |= 1u << sq;
+                oppn_pt[sq] = this->board.board[oppn][r][c];
+            }
+        }
+    }
+
+    uint32_t all_occ = self_occ | oppn_occ;
+    int total_moves = 0;
+
+    // Iterate own pieces via bit scan
+    uint32_t pieces = self_occ;
+    while(pieces){
+        int sq = __builtin_ctz(pieces);
+        pieces &= pieces - 1;
+        int r = BB_ROW(sq), c = BB_COL(sq);
+        int piece = self_pt[sq];
+        uint32_t targets = 0;
+
+        switch(piece){
+            case 1: { // Pawn
+                uint32_t push = bb_pawn_push[self][sq] & ~all_occ;
+                uint32_t cap = bb_pawn_cap[self][sq] & oppn_occ;
+                // Check for king capture in captures
+                uint32_t cap_scan = cap;
+                while(cap_scan){
+                    int to = __builtin_ctz(cap_scan);
+                    cap_scan &= cap_scan - 1;
+                    if(oppn_pt[to] == 6){
+                        return 1;
+                    }
+                }
+                targets = push | cap;
+                break;
+            }
+
+            case 3: { // Knight
+                targets = bb_knight[sq] & ~self_occ;
+                uint32_t opp_targets = targets & oppn_occ;
+                while(opp_targets){
+                    int to = __builtin_ctz(opp_targets);
+                    opp_targets &= opp_targets - 1;
+                    if(oppn_pt[to] == 6){
+                        return 1;
+                    }
+                }
+                break;
+            }
+
+            case 6: { // King
+                targets = bb_king[sq] & ~self_occ;
+                uint32_t opp_targets = targets & oppn_occ;
+                while(opp_targets){
+                    int to = __builtin_ctz(opp_targets);
+                    opp_targets &= opp_targets - 1;
+                    if(oppn_pt[to] == 6){
+                        return 1;
+                    }
+                }
+                break;
+            }
+
+            case 2: // Rook
+            case 4: // Bishop
+            case 5: { // Queen
+                int d_start = (piece == 4) ? 4 : 0;
+                int d_end   = (piece == 2) ? 4 : 8;
+                for(int d = d_start; d < d_end; d++){
+                    int cr = r + bb_dr[d], cc = c + bb_dc[d];
+                    while(cr >= 0 && cr < BOARD_H && cc >= 0 && cc < BOARD_W){
+                        int to = BB_SQ(cr, cc);
+                        uint32_t to_bit = 1u << to;
+                        if(self_occ & to_bit){
+                            break; // own piece blocks
+                        }
+
+                        if((oppn_occ & to_bit) && oppn_pt[to] == 6){
+                            return 1;
+                        }
+
+                        targets |= to_bit;
+                        if(oppn_occ & to_bit){
+                            break; // captured, stop sliding
+                        }
+                        cr += bb_dr[d]; cc += bb_dc[d];
+                    }
+                }
+                break;
+            }
+        }
+
+        if(targets){
+            total_moves += __builtin_popcount(targets);
+        }
+    }
+    return total_moves;
 }
 
 

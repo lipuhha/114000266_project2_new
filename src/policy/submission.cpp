@@ -1,5 +1,6 @@
 #include <utility>
 #include <algorithm>
+#include <unordered_map>
 #include "state.hpp"
 #include "submission.hpp"
 
@@ -7,7 +8,99 @@ static Move g_prev_best_move;
 static uint64_t g_prev_hash = 0;
 
 /*============================================================
- * Submission — eval_ctx (Alpha-Beta Pruning)
+ * Transposition Table (TT) Implementation
+ *============================================================*/
+enum TTFlag {
+    TT_EXACT = 0,
+    TT_ALPHA = 1,
+    TT_BETA = 2
+};
+
+struct TTEntry {
+    int score;
+    int depth;
+    Move best_move;
+    TTFlag flag;
+};
+
+static std::unordered_map<uint64_t, TTEntry> g_tt;
+
+/*============================================================
+ * Submission — quiescence search
+ *============================================================*/
+static int quiescence(
+    State *state,
+    int alpha,
+    int beta,
+    GameHistory& history,
+    int ply,
+    SearchContext& ctx,
+    const SubParams& p
+){
+    ctx.nodes++;
+    if(ply > ctx.seldepth){
+        ctx.seldepth = ply;
+    }
+    if(ctx.stop){
+        return 0;
+    }
+
+    /* === Terminal checks === */
+    if(state->game_state == WIN){
+        return P_MAX - ply;
+    }
+    if(state->game_state == DRAW){
+        return 0;
+    }
+
+    // Standing pat score
+    int stand_pat = state->evaluate(p.use_kp_eval, p.use_eval_mobility, &history);
+    if(stand_pat >= beta){
+        return stand_pat;
+    }
+    if(stand_pat > alpha){
+        alpha = stand_pat;
+    }
+
+    // Lazy move generation
+    if(state->legal_actions.empty() && state->game_state == UNKNOWN){
+        state->get_legal_actions();
+    }
+
+    for(auto& action : state->legal_actions){
+        // Only search captures in quiescence search
+        int target_piece = state->piece_at(1 - state->player, action.second.first, action.second.second);
+        if(target_piece == 0){
+            continue; // Not a capture
+        }
+
+        State* next = state->next_state(action);
+        bool same = next->same_player_as_parent();
+
+        int score;
+        if(same){
+            score = quiescence(next, alpha, beta, history, ply + 1, ctx, p);
+        } else {
+            score = -quiescence(next, -beta, -alpha, history, ply + 1, ctx, p);
+        }
+
+        delete next;
+
+        if(ctx.stop) break;
+
+        if(score >= beta){
+            return score; // Beta cutoff
+        }
+        if(score > alpha){
+            alpha = score;
+        }
+    }
+
+    return alpha;
+}
+
+/*============================================================
+ * Submission — eval_ctx (Alpha-Beta Pruning with TT & Quiescence)
  *============================================================*/
 int Submission::eval_ctx(
     State *state,
@@ -46,19 +139,42 @@ int Submission::eval_ctx(
     if(state->check_repetition(history, rep_score)){
         return rep_score;
     }
-    history.push(state->hash());
+
+    /* === Transposition Table Lookup === */
+    uint64_t hash = state->hash();
+    auto it = g_tt.find(hash);
+    if(it != g_tt.end() && it->second.depth >= depth){
+        if(it->second.flag == TT_EXACT){
+            return it->second.score;
+        } else if(it->second.flag == TT_ALPHA && it->second.score <= alpha){
+            return it->second.score;
+        } else if(it->second.flag == TT_BETA && it->second.score >= beta){
+            return it->second.score;
+        }
+    }
+
+    history.push(hash);
 
     if(depth <= 0){
-        int score = state->evaluate(
-            p.use_kp_eval, p.use_eval_mobility, &history
-        ); 
-        history.pop(state->hash());
+        // Use quiescence search instead of evaluating statically at depth 0
+        int score = quiescence(state, alpha, beta, history, ply, ctx, p);
+        history.pop(hash);
         return score;
     }
 
     /* === Alpha-Beta loop with PVS === */
     int best_score = M_MAX;
     bool first = true;
+    Move best_move;
+    int alpha_orig = alpha;
+
+    // Use best move from TT to order moves if available
+    if(it != g_tt.end()){
+        auto find_it = std::find(state->legal_actions.begin(), state->legal_actions.end(), it->second.best_move);
+        if(find_it != state->legal_actions.end()){
+            std::swap(state->legal_actions[0], *find_it);
+        }
+    }
 
     for(auto& action : state->legal_actions){
         State* next = state->next_state(action);
@@ -96,6 +212,7 @@ int Submission::eval_ctx(
 
         if(score > best_score){
             best_score = score;
+            best_move = action;
         }
 
         // Alpha-Beta pruning logic
@@ -104,16 +221,30 @@ int Submission::eval_ctx(
         }
 
         if(alpha >= beta){
-            // The opponent had a better alternative earlier (beta),
-            // so they will avoid this branch entirely. Prune it!
+            // Prune!
             break;
         }
     }
 
-    history.pop(state->hash());
+    /* === Store in Transposition Table === */
+    if(!ctx.stop){
+        TTEntry entry;
+        entry.score = best_score;
+        entry.depth = depth;
+        entry.best_move = best_move;
+        if(best_score <= alpha_orig){
+            entry.flag = TT_ALPHA;
+        } else if(best_score >= beta){
+            entry.flag = TT_BETA;
+        } else {
+            entry.flag = TT_EXACT;
+        }
+        g_tt[hash] = entry;
+    }
+
+    history.pop(hash);
     return best_score;
 }
-
 
 /*============================================================
  * Submission — search
@@ -141,9 +272,24 @@ SearchResult Submission::search(
     int alpha = M_MAX;
     int beta = P_MAX;
 
-    // Iterative Deepening Move Ordering
+    // Iterative Deepening / TT Move Ordering
+    Move tt_best_move;
+    bool hash_found = false;
     if(g_prev_hash == state->hash()){
-        auto it = std::find(state->legal_actions.begin(), state->legal_actions.end(), g_prev_best_move);
+        tt_best_move = g_prev_best_move;
+        hash_found = true;
+    } else {
+        g_tt.clear(); // Clear Transposition Table for a new search/turn
+    }
+
+    auto tt_it = g_tt.find(state->hash());
+    if(tt_it != g_tt.end()){
+        tt_best_move = tt_it->second.best_move;
+        hash_found = true;
+    }
+
+    if(hash_found){
+        auto it = std::find(state->legal_actions.begin(), state->legal_actions.end(), tt_best_move);
         if(it != state->legal_actions.end()){
             std::swap(state->legal_actions[0], *it);
         }
@@ -205,9 +351,18 @@ SearchResult Submission::search(
     if(!ctx.stop){
         g_prev_best_move = result.best_move;
         g_prev_hash = state->hash();
+
+        // Also store root node results in TT
+        TTEntry entry;
+        entry.score = best_score;
+        entry.depth = depth;
+        entry.best_move = result.best_move;
+        entry.flag = TT_EXACT;
+        g_tt[state->hash()] = entry;
     }
 
     result.score = best_score;
+    result.nodes = ctx.nodes; // Fix the diagnostic logs displaying 0 nodes
     if(result.best_move.first != result.best_move.second) {
         result.pv.push_back(result.best_move);
     }

@@ -414,6 +414,8 @@ static void do_search(
 
                 SearchContext sub_ctx;
                 sub_ctx.params = ctx.params;
+                sub_ctx.movetime_ms = ctx.movetime_ms;
+                sub_ctx.search_start = ctx.search_start;
                 SearchResult sub = g_algo->search(&state, depth, history, sub_ctx);
 
                 if(!alive()){
@@ -500,6 +502,8 @@ static void cmd_go(std::istringstream& iss){
 
     SearchContext ctx;
     ctx.params = g_params;
+    ctx.movetime_ms = movetime_ms;
+    ctx.search_start = std::chrono::steady_clock::now();
     g_ctx.stop = false;
     g_searching = true;
     g_bestmove_sent = false;

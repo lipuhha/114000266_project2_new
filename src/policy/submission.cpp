@@ -45,6 +45,15 @@ static int quiescence(
         return 0;
     }
 
+    if(ctx.nodes % 2048 == 0 && ctx.movetime_ms > 0){
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - ctx.search_start).count();
+        if(elapsed >= ctx.movetime_ms - 150){
+            ctx.stop = true;
+            return 0;
+        }
+    }
+
     /* === Terminal checks === */
     if(state->game_state == WIN){
         return P_MAX - ply;
@@ -118,6 +127,15 @@ int Submission::eval_ctx(
     }
     if(ctx.stop){
         return 0;
+    }
+
+    if(ctx.nodes % 2048 == 0 && ctx.movetime_ms > 0){
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - ctx.search_start).count();
+        if(elapsed >= ctx.movetime_ms - 150){
+            ctx.stop = true;
+            return 0;
+        }
     }
 
     /* === Lazy move generation === */

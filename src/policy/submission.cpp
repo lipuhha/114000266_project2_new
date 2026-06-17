@@ -1,6 +1,6 @@
 #include <utility>
 #include <algorithm>
-#include <unordered_map>
+#include <vector>
 #include "state.hpp"
 #include "submission.hpp"
 
@@ -17,13 +17,14 @@ enum TTFlag {
 };
 
 struct TTEntry {
-    int score;
-    int depth;
+    uint64_t hash = 0;
+    int score = 0;
+    int depth = 0;
     Move best_move;
-    TTFlag flag;
+    TTFlag flag = TT_EXACT;
 };
 
-static std::unordered_map<uint64_t, TTEntry> g_tt;
+static std::vector<TTEntry> g_tt_array;
 
 /*============================================================
  * Killer Moves Implementation
@@ -71,6 +72,9 @@ static int quiescence(
 
     // Standing pat score
     int stand_pat = state->evaluate(p.use_kp_eval, p.use_eval_mobility, &history);
+    if (ply >= p.quiescence_max_depth) {
+        return stand_pat;
+    }
     if(stand_pat >= beta){
         return stand_pat;
     }
@@ -172,14 +176,23 @@ int Submission::eval_ctx(
 
     /* === Transposition Table Lookup === */
     uint64_t hash = state->hash();
-    auto it = g_tt.find(hash);
-    if(it != g_tt.end() && it->second.depth >= depth){
-        if(it->second.flag == TT_EXACT){
-            return it->second.score;
-        } else if(it->second.flag == TT_ALPHA && it->second.score <= alpha){
-            return it->second.score;
-        } else if(it->second.flag == TT_BETA && it->second.score >= beta){
-            return it->second.score;
+    bool tt_hit = false;
+    TTEntry tt_entry;
+    if (p.use_tt && !g_tt_array.empty()) {
+        size_t idx = hash % g_tt_array.size();
+        if (g_tt_array[idx].hash == hash && g_tt_array[idx].depth >= depth) {
+            tt_hit = true;
+            tt_entry = g_tt_array[idx];
+        }
+    }
+
+    if (tt_hit) {
+        if(tt_entry.flag == TT_EXACT){
+            return tt_entry.score;
+        } else if(tt_entry.flag == TT_ALPHA && tt_entry.score <= alpha){
+            return tt_entry.score;
+        } else if(tt_entry.flag == TT_BETA && tt_entry.score >= beta){
+            return tt_entry.score;
         }
     }
 
@@ -196,13 +209,18 @@ int Submission::eval_ctx(
         if(has_non_king) break;
     }
 
-    if(allow_null && depth >= 3 && has_non_king){
+    if(p.use_null_move && allow_null && depth >= 3 && has_non_king){
         State* null_state = dynamic_cast<State*>(state->create_null_state());
         if(null_state){
-            int score = -eval_ctx(null_state, depth - 1 - 2, -beta, -beta + 1, history, ply + 1, ctx, p, false);
-            delete null_state;
-            if(score >= beta && !ctx.stop){
-                return score;
+            // Avoid null move pruning if we are in check (opponent can capture our king)
+            if (null_state->game_state != WIN) {
+                int score = -eval_ctx(null_state, depth - 1 - p.null_move_r, -beta, -beta + 1, history, ply + 1, ctx, p, false);
+                delete null_state;
+                if(score >= beta && !ctx.stop){
+                    return score;
+                }
+            } else {
+                delete null_state;
             }
         }
     }
@@ -210,8 +228,12 @@ int Submission::eval_ctx(
     history.push(hash);
 
     if(depth <= 0){
-        // Use quiescence search instead of evaluating statically at depth 0
-        int score = quiescence(state, alpha, beta, history, ply, ctx, p);
+        int score;
+        if (p.use_quiescence) {
+            score = quiescence(state, alpha, beta, history, ply, ctx, p);
+        } else {
+            score = state->evaluate(p.use_kp_eval, p.use_eval_mobility, &history);
+        }
         history.pop(hash);
         return score;
     }
@@ -223,11 +245,18 @@ int Submission::eval_ctx(
     int alpha_orig = alpha;
 
     // Order moves using TT best move, captures, and killer moves
-    bool has_tt = (it != g_tt.end());
-    Move tt_best_move = has_tt ? it->second.best_move : Move();
+    bool has_tt = false;
+    Move tt_best_move;
+    if (p.use_tt && !g_tt_array.empty()) {
+        size_t idx = hash % g_tt_array.size();
+        if (g_tt_array[idx].hash == hash) {
+            has_tt = true;
+            tt_best_move = g_tt_array[idx].best_move;
+        }
+    }
 
     auto get_move_score = [&](const Move& action) {
-        if (has_tt && action == tt_best_move) {
+        if (p.use_tt && has_tt && action == tt_best_move) {
             return 10000;
         }
         int victim = state->piece_at(1 - state->player, action.second.first, action.second.second);
@@ -240,7 +269,7 @@ int Submission::eval_ctx(
         if (is_promotion) {
             return 900;
         }
-        if (ply < MAX_PLY) {
+        if (p.use_killer_moves && ply < MAX_PLY) {
             if (action == g_killers[0][ply]) {
                 return 100;
             }
@@ -251,9 +280,11 @@ int Submission::eval_ctx(
         return 0;
     };
 
-    std::stable_sort(state->legal_actions.begin(), state->legal_actions.end(), [&](const Move& a, const Move& b) {
-        return get_move_score(a) > get_move_score(b);
-    });
+    if (p.use_move_ordering) {
+        std::stable_sort(state->legal_actions.begin(), state->legal_actions.end(), [&](const Move& a, const Move& b) {
+            return get_move_score(a) > get_move_score(b);
+        });
+    }
 
     int move_count = 0;
     for(auto& action : state->legal_actions){
@@ -276,11 +307,11 @@ int Submission::eval_ctx(
             int attacker = state->piece_at(state->player, action.first.first, action.first.second);
             bool is_capture = (victim != 0);
             bool is_promotion = (attacker == 1 && (action.second.first == BOARD_H - 1 || action.second.first == 0));
-            bool is_killer = (ply < MAX_PLY && (action == g_killers[0][ply] || action == g_killers[1][ply]));
+            bool is_killer = (p.use_killer_moves && ply < MAX_PLY && (action == g_killers[0][ply] || action == g_killers[1][ply]));
 
-            if (depth >= 3 && move_count >= 3 && !is_capture && !is_promotion && !is_killer) {
+            if (p.use_lmr && depth >= p.lmr_depth_limit && move_count >= p.lmr_full_depth && !is_capture && !is_promotion && !is_killer) {
                 reduction = 1;
-                if (depth >= 6 && move_count >= 8) {
+                if (depth >= p.lmr_depth_limit + 3 && move_count >= p.lmr_full_depth + 5) {
                     reduction = 2;
                 }
             }
@@ -323,14 +354,16 @@ int Submission::eval_ctx(
         if(alpha >= beta){
             // Prune!
             // Store killer move if it's a quiet move
-            int target_piece = state->piece_at(1 - state->player, action.second.first, action.second.second);
-            if(target_piece == 0 && ply < MAX_PLY){
-                if(g_killers[0][ply] != action){
-                    if(g_killers[1][ply] == action){
-                        std::swap(g_killers[0][ply], g_killers[1][ply]);
-                    } else {
-                        g_killers[1][ply] = g_killers[0][ply];
-                        g_killers[0][ply] = action;
+            if (p.use_killer_moves) {
+                int target_piece = state->piece_at(1 - state->player, action.second.first, action.second.second);
+                if(target_piece == 0 && ply < MAX_PLY){
+                    if(g_killers[0][ply] != action){
+                        if(g_killers[1][ply] == action){
+                            std::swap(g_killers[0][ply], g_killers[1][ply]);
+                        } else {
+                            g_killers[1][ply] = g_killers[0][ply];
+                            g_killers[0][ply] = action;
+                        }
                     }
                 }
             }
@@ -340,19 +373,23 @@ int Submission::eval_ctx(
     }
 
     /* === Store in Transposition Table === */
-    if(!ctx.stop){
-        TTEntry entry;
-        entry.score = best_score;
-        entry.depth = depth;
-        entry.best_move = best_move;
-        if(best_score <= alpha_orig){
-            entry.flag = TT_ALPHA;
-        } else if(best_score >= beta){
-            entry.flag = TT_BETA;
-        } else {
-            entry.flag = TT_EXACT;
+    if(!ctx.stop && p.use_tt && !g_tt_array.empty()){
+        size_t idx = hash % g_tt_array.size();
+        if (g_tt_array[idx].hash != hash || depth >= g_tt_array[idx].depth) {
+            TTEntry entry;
+            entry.hash = hash;
+            entry.score = best_score;
+            entry.depth = depth;
+            entry.best_move = best_move;
+            if(best_score <= alpha_orig){
+                entry.flag = TT_ALPHA;
+            } else if(best_score >= beta){
+                entry.flag = TT_BETA;
+            } else {
+                entry.flag = TT_EXACT;
+            }
+            g_tt_array[idx] = entry;
         }
-        g_tt[hash] = entry;
     }
 
     history.pop(hash);
@@ -386,31 +423,50 @@ SearchResult Submission::search(
     int beta = P_MAX;
 
     // Clear Killer Moves table for the new search
-    for(int i = 0; i < 2; ++i){
-        for(int j = 0; j < MAX_PLY; ++j){
-            g_killers[i][j] = Move();
+    if (p.use_killer_moves) {
+        for(int i = 0; i < 2; ++i){
+            for(int j = 0; j < MAX_PLY; ++j){
+                g_killers[i][j] = Move();
+            }
         }
+    }
+
+    // Handle TT size and initialization
+    if (p.use_tt) {
+        size_t target_entries = (size_t)p.hash_size_mb * 1024 * 1024 / sizeof(TTEntry);
+        if (target_entries < 1024) target_entries = 1024;
+        if (g_tt_array.size() != target_entries) {
+            g_tt_array.assign(target_entries, TTEntry{});
+        }
+    } else {
+        g_tt_array.clear();
     }
 
     // Iterative Deepening / TT Move Ordering
     Move tt_best_move;
     bool hash_found = false;
-    if(g_prev_hash == state->hash()){
-        tt_best_move = g_prev_best_move;
-        hash_found = true;
+    if (p.use_tt) {
+        if(g_prev_hash == state->hash()){
+            tt_best_move = g_prev_best_move;
+            hash_found = true;
+        } else {
+            // Clear Transposition Table for a new search/turn
+            std::fill(g_tt_array.begin(), g_tt_array.end(), TTEntry{});
+        }
+        if (!g_tt_array.empty()) {
+            size_t idx = state->hash() % g_tt_array.size();
+            if (g_tt_array[idx].hash == state->hash()) {
+                tt_best_move = g_tt_array[idx].best_move;
+                hash_found = true;
+            }
+        }
     } else {
-        g_tt.clear(); // Clear Transposition Table for a new search/turn
-    }
-
-    auto tt_it = g_tt.find(state->hash());
-    if(tt_it != g_tt.end()){
-        tt_best_move = tt_it->second.best_move;
-        hash_found = true;
+        std::fill(g_tt_array.begin(), g_tt_array.end(), TTEntry{});
     }
 
     // Order moves at the root
     auto get_move_score = [&](const Move& action) {
-        if(hash_found && action == tt_best_move){
+        if(p.use_tt && hash_found && action == tt_best_move){
             return 10000;
         }
         int victim = state->piece_at(1 - state->player, action.second.first, action.second.second);
@@ -426,9 +482,11 @@ SearchResult Submission::search(
         return 0;
     };
 
-    std::stable_sort(state->legal_actions.begin(), state->legal_actions.end(), [&](const Move& a, const Move& b) {
-        return get_move_score(a) > get_move_score(b);
-    });
+    if (p.use_move_ordering) {
+        std::stable_sort(state->legal_actions.begin(), state->legal_actions.end(), [&](const Move& a, const Move& b) {
+            return get_move_score(a) > get_move_score(b);
+        });
+    }
 
     bool first = true;
 
@@ -453,9 +511,9 @@ SearchResult Submission::search(
             bool is_capture = (victim != 0);
             bool is_promotion = (attacker == 1 && (action.second.first == BOARD_H - 1 || action.second.first == 0));
 
-            if (depth >= 3 && move_index >= 3 && !is_capture && !is_promotion) {
+            if (p.use_lmr && depth >= p.lmr_depth_limit && move_index >= p.lmr_full_depth && !is_capture && !is_promotion) {
                 reduction = 1;
-                if (depth >= 6 && move_index >= 8) {
+                if (depth >= p.lmr_depth_limit + 3 && move_index >= p.lmr_full_depth + 5) {
                     reduction = 2;
                 }
             }
@@ -502,17 +560,21 @@ SearchResult Submission::search(
         move_index++;
     }
 
-    if(!ctx.stop){
+    if(!ctx.stop && p.use_tt){
         g_prev_best_move = result.best_move;
         g_prev_hash = state->hash();
 
         // Also store root node results in TT
-        TTEntry entry;
-        entry.score = best_score;
-        entry.depth = depth;
-        entry.best_move = result.best_move;
-        entry.flag = TT_EXACT;
-        g_tt[state->hash()] = entry;
+        if (!g_tt_array.empty()) {
+            size_t idx = state->hash() % g_tt_array.size();
+            TTEntry entry;
+            entry.hash = state->hash();
+            entry.score = best_score;
+            entry.depth = depth;
+            entry.best_move = result.best_move;
+            entry.flag = TT_EXACT;
+            g_tt_array[idx] = entry;
+        }
     }
 
     result.score = best_score;
@@ -532,6 +594,17 @@ ParamMap Submission::default_params(){
         {"UseKPEval", "true"},
         {"UseEvalMobility", "true"},
         {"ReportPartial", "true"},
+        {"UseTT", "true"},
+        {"UseQuiescence", "true"},
+        {"UseKillerMoves", "true"},
+        {"UseNullMove", "true"},
+        {"UseLMR", "true"},
+        {"UseMoveOrdering", "true"},
+        {"QuiescenceMaxDepth", "16"},
+        {"NullMoveR", "2"},
+        {"LMRFullDepth", "3"},
+        {"LMRDepthLimit", "3"},
+        {"Hash", "64"}
     };
 }
 
@@ -540,5 +613,16 @@ std::vector<ParamDef> Submission::param_defs(){
         {"UseKPEval", ParamDef::CHECK, "true"},
         {"UseEvalMobility", ParamDef::CHECK, "true"},
         {"ReportPartial", ParamDef::CHECK, "true"},
+        {"UseTT", ParamDef::CHECK, "true"},
+        {"UseQuiescence", ParamDef::CHECK, "true"},
+        {"UseKillerMoves", ParamDef::CHECK, "true"},
+        {"UseNullMove", ParamDef::CHECK, "true"},
+        {"UseLMR", ParamDef::CHECK, "true"},
+        {"UseMoveOrdering", ParamDef::CHECK, "true"},
+        {"QuiescenceMaxDepth", ParamDef::SPIN, "16", 0, 64},
+        {"NullMoveR", ParamDef::SPIN, "2", 1, 4},
+        {"LMRFullDepth", ParamDef::SPIN, "3", 1, 20},
+        {"LMRDepthLimit", ParamDef::SPIN, "3", 1, 20},
+        {"Hash", ParamDef::SPIN, "64", 1, 1024}
     };
 }

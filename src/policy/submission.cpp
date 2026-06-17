@@ -26,6 +26,13 @@ struct TTEntry {
 static std::unordered_map<uint64_t, TTEntry> g_tt;
 
 /*============================================================
+ * Killer Moves Implementation
+ *============================================================*/
+constexpr int MAX_PLY = 128;
+static Move g_killers[2][MAX_PLY];
+
+
+/*============================================================
  * Submission — quiescence search
  *============================================================*/
 static int quiescence(
@@ -186,13 +193,32 @@ int Submission::eval_ctx(
     Move best_move;
     int alpha_orig = alpha;
 
-    // Use best move from TT to order moves if available
-    if(it != g_tt.end()){
-        auto find_it = std::find(state->legal_actions.begin(), state->legal_actions.end(), it->second.best_move);
-        if(find_it != state->legal_actions.end()){
-            std::swap(state->legal_actions[0], *find_it);
+    // Order moves using TT best move, captures, and killer moves
+    bool has_tt = (it != g_tt.end());
+    Move tt_best_move = has_tt ? it->second.best_move : Move();
+
+    auto get_move_score = [&](const Move& action) {
+        if (has_tt && action == tt_best_move) {
+            return 10000;
         }
-    }
+        bool is_capture = (state->piece_at(1 - state->player, action.second.first, action.second.second) != 0);
+        if (is_capture) {
+            return 1000;
+        }
+        if (ply < MAX_PLY) {
+            if (action == g_killers[0][ply]) {
+                return 100;
+            }
+            if (action == g_killers[1][ply]) {
+                return 90;
+            }
+        }
+        return 0;
+    };
+
+    std::stable_sort(state->legal_actions.begin(), state->legal_actions.end(), [&](const Move& a, const Move& b) {
+        return get_move_score(a) > get_move_score(b);
+    });
 
     for(auto& action : state->legal_actions){
         State* next = state->next_state(action);
@@ -240,6 +266,14 @@ int Submission::eval_ctx(
 
         if(alpha >= beta){
             // Prune!
+            // Store killer move if it's a quiet move
+            int target_piece = state->piece_at(1 - state->player, action.second.first, action.second.second);
+            if(target_piece == 0 && ply < MAX_PLY){
+                if(g_killers[0][ply] != action){
+                    g_killers[1][ply] = g_killers[0][ply];
+                    g_killers[0][ply] = action;
+                }
+            }
             break;
         }
     }
@@ -290,6 +324,13 @@ SearchResult Submission::search(
     int alpha = M_MAX;
     int beta = P_MAX;
 
+    // Clear Killer Moves table for the new search
+    for(int i = 0; i < 2; ++i){
+        for(int j = 0; j < MAX_PLY; ++j){
+            g_killers[i][j] = Move();
+        }
+    }
+
     // Iterative Deepening / TT Move Ordering
     Move tt_best_move;
     bool hash_found = false;
@@ -306,12 +347,21 @@ SearchResult Submission::search(
         hash_found = true;
     }
 
-    if(hash_found){
-        auto it = std::find(state->legal_actions.begin(), state->legal_actions.end(), tt_best_move);
-        if(it != state->legal_actions.end()){
-            std::swap(state->legal_actions[0], *it);
+    // Order moves at the root
+    auto get_move_score = [&](const Move& action) {
+        if(hash_found && action == tt_best_move){
+            return 10000;
         }
-    }
+        bool is_capture = (state->piece_at(1 - state->player, action.second.first, action.second.second) != 0);
+        if(is_capture){
+            return 1000;
+        }
+        return 0;
+    };
+
+    std::stable_sort(state->legal_actions.begin(), state->legal_actions.end(), [&](const Move& a, const Move& b) {
+        return get_move_score(a) > get_move_score(b);
+    });
 
     bool first = true;
 

@@ -205,9 +205,15 @@ int Submission::eval_ctx(
         if (has_tt && action == tt_best_move) {
             return 10000;
         }
-        bool is_capture = (state->piece_at(1 - state->player, action.second.first, action.second.second) != 0);
-        if (is_capture) {
-            return 1000;
+        int victim = state->piece_at(1 - state->player, action.second.first, action.second.second);
+        int attacker = state->piece_at(state->player, action.first.first, action.first.second);
+        if (victim != 0) {
+            return 1000 + PIECE_VALUES[victim] * 10 - PIECE_VALUES[attacker];
+        }
+        // Quiet promotions
+        bool is_promotion = (attacker == 1 && (action.second.first == BOARD_H - 1 || action.second.first == 0));
+        if (is_promotion) {
+            return 900;
         }
         if (ply < MAX_PLY) {
             if (action == g_killers[0][ply]) {
@@ -360,9 +366,15 @@ SearchResult Submission::search(
         if(hash_found && action == tt_best_move){
             return 10000;
         }
-        bool is_capture = (state->piece_at(1 - state->player, action.second.first, action.second.second) != 0);
-        if(is_capture){
-            return 1000;
+        int victim = state->piece_at(1 - state->player, action.second.first, action.second.second);
+        int attacker = state->piece_at(state->player, action.first.first, action.first.second);
+        if (victim != 0) {
+            return 1000 + PIECE_VALUES[victim] * 10 - PIECE_VALUES[attacker];
+        }
+        // Quiet promotions
+        bool is_promotion = (attacker == 1 && (action.second.first == BOARD_H - 1 || action.second.first == 0));
+        if (is_promotion) {
+            return 900;
         }
         return 0;
     };

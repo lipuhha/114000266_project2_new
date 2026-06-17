@@ -84,10 +84,14 @@ static int quiescence(
     }
 
     for(auto& action : state->legal_actions){
-        // Only search captures in quiescence search
+        // Only search captures and promotions in quiescence search
         int target_piece = state->piece_at(1 - state->player, action.second.first, action.second.second);
-        if(target_piece == 0){
-            continue; // Not a capture
+        int moving_piece = state->piece_at(state->player, action.first.first, action.first.second);
+        bool is_capture = (target_piece != 0);
+        bool is_promotion = (moving_piece == 1 && (action.second.first == BOARD_H - 1 || action.second.first == 0));
+
+        if(!is_capture && !is_promotion){
+            continue;
         }
 
         State* next = state->next_state(action);
@@ -270,8 +274,12 @@ int Submission::eval_ctx(
             int target_piece = state->piece_at(1 - state->player, action.second.first, action.second.second);
             if(target_piece == 0 && ply < MAX_PLY){
                 if(g_killers[0][ply] != action){
-                    g_killers[1][ply] = g_killers[0][ply];
-                    g_killers[0][ply] = action;
+                    if(g_killers[1][ply] == action){
+                        std::swap(g_killers[0][ply], g_killers[1][ply]);
+                    } else {
+                        g_killers[1][ply] = g_killers[0][ply];
+                        g_killers[0][ply] = action;
+                    }
                 }
             }
             break;

@@ -27,10 +27,11 @@ struct TTEntry {
 static std::vector<TTEntry> g_tt_array;
 
 /*============================================================
- * Killer Moves Implementation
+ * Killer & History Moves Implementation
  *============================================================*/
 constexpr int MAX_PLY = 128;
 static Move g_killers[2][MAX_PLY];
+static int g_history[7][30];
 
 /*============================================================
  * Helper Functions (TT, Move Ordering, LMR)
@@ -74,7 +75,8 @@ static void order_moves(State* state, std::vector<Move>& moves, const SubParams&
             if (action == g_killers[0][ply]) return 100;
             if (action == g_killers[1][ply]) return 90;
         }
-        return 0;
+        int to_sq = action.second.first * BOARD_W + action.second.second;
+        return std::min(80, g_history[attacker][to_sq]);
     };
     std::stable_sort(moves.begin(), moves.end(), [&](const Move& a, const Move& b) {
         return get_move_score(a) > get_move_score(b);
@@ -359,10 +361,13 @@ int Submission::eval_ctx(
 
         if(alpha >= beta){
             // Prune!
-            // Store killer move if it's a quiet move
-            if (p.use_killer_moves) {
-                int target_piece = state->piece_at(1 - state->player, action.second.first, action.second.second);
-                if(target_piece == 0 && ply < MAX_PLY){
+            int target_piece = state->piece_at(1 - state->player, action.second.first, action.second.second);
+            if(target_piece == 0){
+                int attacker = state->piece_at(state->player, action.first.first, action.first.second);
+                int to_sq = action.second.first * BOARD_W + action.second.second;
+                g_history[attacker][to_sq] += depth * depth;
+
+                if (p.use_killer_moves && ply < MAX_PLY) {
                     if(g_killers[0][ply] != action){
                         if(g_killers[1][ply] == action){
                             std::swap(g_killers[0][ply], g_killers[1][ply]);
@@ -419,12 +424,17 @@ SearchResult Submission::search(
     int alpha = M_MAX;
     int beta = P_MAX;
 
-    // Clear Killer Moves table for the new search
+    // Clear Killer & History tables for the new search
     if (p.use_killer_moves) {
         for(int i = 0; i < 2; ++i){
             for(int j = 0; j < MAX_PLY; ++j){
                 g_killers[i][j] = Move();
             }
+        }
+    }
+    for(int i = 0; i < 7; ++i){
+        for(int j = 0; j < 30; ++j){
+            g_history[i][j] = 0;
         }
     }
 

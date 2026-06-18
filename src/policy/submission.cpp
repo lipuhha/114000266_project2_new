@@ -32,6 +32,64 @@ static std::vector<TTEntry> g_tt_array;
 constexpr int MAX_PLY = 128;
 static Move g_killers[2][MAX_PLY];
 
+/*============================================================
+ * Helper Functions (TT, Move Ordering, LMR)
+ *============================================================*/
+static bool tt_probe(uint64_t hash, TTEntry& entry) {
+    if (!g_tt_array.empty()) {
+        size_t idx = hash % g_tt_array.size();
+        if (g_tt_array[idx].hash == hash) {
+            entry = g_tt_array[idx];
+            return true;
+        }
+    }
+    return false;
+}
+
+static void tt_store(uint64_t hash, int depth, int score, Move best_move, TTFlag flag) {
+    if (!g_tt_array.empty()) {
+        size_t idx = hash % g_tt_array.size();
+        if (g_tt_array[idx].hash != hash || depth >= g_tt_array[idx].depth) {
+            g_tt_array[idx] = TTEntry{hash, score, depth, best_move, flag};
+        }
+    }
+}
+
+static void order_moves(State* state, std::vector<Move>& moves, const SubParams& p, bool has_tt, const Move& tt_best_move, int ply, bool use_killer) {
+    if (!p.use_move_ordering) return;
+    auto get_move_score = [&](const Move& action) {
+        if (p.use_tt && has_tt && action == tt_best_move) {
+            return 10000;
+        }
+        int victim = state->piece_at(1 - state->player, action.second.first, action.second.second);
+        int attacker = state->piece_at(state->player, action.first.first, action.first.second);
+        if (victim != 0) {
+            return 1000 + PIECE_VALUES[victim] * 10 - PIECE_VALUES[attacker];
+        }
+        bool is_promotion = (attacker == 1 && (action.second.first == BOARD_H - 1 || action.second.first == 0));
+        if (is_promotion) {
+            return 900;
+        }
+        if (use_killer && ply < MAX_PLY) {
+            if (action == g_killers[0][ply]) return 100;
+            if (action == g_killers[1][ply]) return 90;
+        }
+        return 0;
+    };
+    std::stable_sort(moves.begin(), moves.end(), [&](const Move& a, const Move& b) {
+        return get_move_score(a) > get_move_score(b);
+    });
+}
+
+static int get_lmr_reduction(int depth, int move_count, bool is_capture, bool is_promotion, bool is_killer, const SubParams& p) {
+    if (p.use_lmr && depth >= p.lmr_depth_limit && move_count >= p.lmr_full_depth && !is_capture && !is_promotion && !is_killer) {
+        if (depth >= p.lmr_depth_limit + 3 && move_count >= p.lmr_full_depth + 5) {
+            return 2;
+        }
+        return 1;
+    }
+    return 0;
+}
 
 /*============================================================
  * Submission — quiescence search
@@ -176,17 +234,10 @@ int Submission::eval_ctx(
 
     /* === Transposition Table Lookup === */
     uint64_t hash = state->hash();
-    bool tt_hit = false;
     TTEntry tt_entry;
-    if (p.use_tt && !g_tt_array.empty()) {
-        size_t idx = hash % g_tt_array.size();
-        if (g_tt_array[idx].hash == hash && g_tt_array[idx].depth >= depth) {
-            tt_hit = true;
-            tt_entry = g_tt_array[idx];
-        }
-    }
-
-    if (tt_hit) {
+    bool has_tt = p.use_tt && tt_probe(hash, tt_entry);
+    
+    if (has_tt && tt_entry.depth >= depth) {
         if(tt_entry.flag == TT_EXACT){
             return tt_entry.score;
         } else if(tt_entry.flag == TT_ALPHA && tt_entry.score <= alpha){
@@ -245,46 +296,8 @@ int Submission::eval_ctx(
     int alpha_orig = alpha;
 
     // Order moves using TT best move, captures, and killer moves
-    bool has_tt = false;
-    Move tt_best_move;
-    if (p.use_tt && !g_tt_array.empty()) {
-        size_t idx = hash % g_tt_array.size();
-        if (g_tt_array[idx].hash == hash) {
-            has_tt = true;
-            tt_best_move = g_tt_array[idx].best_move;
-        }
-    }
-
-    auto get_move_score = [&](const Move& action) {
-        if (p.use_tt && has_tt && action == tt_best_move) {
-            return 10000;
-        }
-        int victim = state->piece_at(1 - state->player, action.second.first, action.second.second);
-        int attacker = state->piece_at(state->player, action.first.first, action.first.second);
-        if (victim != 0) {
-            return 1000 + PIECE_VALUES[victim] * 10 - PIECE_VALUES[attacker];
-        }
-        // Quiet promotions
-        bool is_promotion = (attacker == 1 && (action.second.first == BOARD_H - 1 || action.second.first == 0));
-        if (is_promotion) {
-            return 900;
-        }
-        if (p.use_killer_moves && ply < MAX_PLY) {
-            if (action == g_killers[0][ply]) {
-                return 100;
-            }
-            if (action == g_killers[1][ply]) {
-                return 90;
-            }
-        }
-        return 0;
-    };
-
-    if (p.use_move_ordering) {
-        std::stable_sort(state->legal_actions.begin(), state->legal_actions.end(), [&](const Move& a, const Move& b) {
-            return get_move_score(a) > get_move_score(b);
-        });
-    }
+    Move tt_best_move = has_tt ? tt_entry.best_move : Move();
+    order_moves(state, state->legal_actions, p, has_tt, tt_best_move, ply, p.use_killer_moves);
 
     int move_count = 0;
     for(auto& action : state->legal_actions){
@@ -302,20 +315,13 @@ int Submission::eval_ctx(
             first = false;
         } else {
             // Subsequent moves: check LMR
-            int reduction = 0;
             int victim = state->piece_at(1 - state->player, action.second.first, action.second.second);
             int attacker = state->piece_at(state->player, action.first.first, action.first.second);
             bool is_capture = (victim != 0);
             bool is_promotion = (attacker == 1 && (action.second.first == BOARD_H - 1 || action.second.first == 0));
             bool is_killer = (p.use_killer_moves && ply < MAX_PLY && (action == g_killers[0][ply] || action == g_killers[1][ply]));
 
-            if (p.use_lmr && depth >= p.lmr_depth_limit && move_count >= p.lmr_full_depth && !is_capture && !is_promotion && !is_killer) {
-                reduction = 1;
-                if (depth >= p.lmr_depth_limit + 3 && move_count >= p.lmr_full_depth + 5) {
-                    reduction = 2;
-                }
-            }
-
+            int reduction = get_lmr_reduction(depth, move_count, is_capture, is_promotion, is_killer, p);
             int reduced_depth = std::max(0, depth - 1 - reduction);
 
             if(same){
@@ -373,23 +379,14 @@ int Submission::eval_ctx(
     }
 
     /* === Store in Transposition Table === */
-    if(!ctx.stop && p.use_tt && !g_tt_array.empty()){
-        size_t idx = hash % g_tt_array.size();
-        if (g_tt_array[idx].hash != hash || depth >= g_tt_array[idx].depth) {
-            TTEntry entry;
-            entry.hash = hash;
-            entry.score = best_score;
-            entry.depth = depth;
-            entry.best_move = best_move;
-            if(best_score <= alpha_orig){
-                entry.flag = TT_ALPHA;
-            } else if(best_score >= beta){
-                entry.flag = TT_BETA;
-            } else {
-                entry.flag = TT_EXACT;
-            }
-            g_tt_array[idx] = entry;
+    if(!ctx.stop && p.use_tt){
+        TTFlag flag = TT_EXACT;
+        if(best_score <= alpha_orig){
+            flag = TT_ALPHA;
+        } else if(best_score >= beta){
+            flag = TT_BETA;
         }
+        tt_store(hash, depth, best_score, best_move, flag);
     }
 
     history.pop(hash);
@@ -453,40 +450,17 @@ SearchResult Submission::search(
             // Clear Transposition Table for a new search/turn
             std::fill(g_tt_array.begin(), g_tt_array.end(), TTEntry{});
         }
-        if (!g_tt_array.empty()) {
-            size_t idx = state->hash() % g_tt_array.size();
-            if (g_tt_array[idx].hash == state->hash()) {
-                tt_best_move = g_tt_array[idx].best_move;
-                hash_found = true;
-            }
+        TTEntry tt_entry;
+        if (tt_probe(state->hash(), tt_entry)) {
+            tt_best_move = tt_entry.best_move;
+            hash_found = true;
         }
     } else {
         std::fill(g_tt_array.begin(), g_tt_array.end(), TTEntry{});
     }
 
     // Order moves at the root
-    auto get_move_score = [&](const Move& action) {
-        if(p.use_tt && hash_found && action == tt_best_move){
-            return 10000;
-        }
-        int victim = state->piece_at(1 - state->player, action.second.first, action.second.second);
-        int attacker = state->piece_at(state->player, action.first.first, action.first.second);
-        if (victim != 0) {
-            return 1000 + PIECE_VALUES[victim] * 10 - PIECE_VALUES[attacker];
-        }
-        // Quiet promotions
-        bool is_promotion = (attacker == 1 && (action.second.first == BOARD_H - 1 || action.second.first == 0));
-        if (is_promotion) {
-            return 900;
-        }
-        return 0;
-    };
-
-    if (p.use_move_ordering) {
-        std::stable_sort(state->legal_actions.begin(), state->legal_actions.end(), [&](const Move& a, const Move& b) {
-            return get_move_score(a) > get_move_score(b);
-        });
-    }
+    order_moves(state, state->legal_actions, p, hash_found, tt_best_move, 0, false);
 
     bool first = true;
 
@@ -505,19 +479,12 @@ SearchResult Submission::search(
             first = false;
         } else {
             // Subsequent moves: check LMR
-            int reduction = 0;
             int victim = state->piece_at(1 - state->player, action.second.first, action.second.second);
             int attacker = state->piece_at(state->player, action.first.first, action.first.second);
             bool is_capture = (victim != 0);
             bool is_promotion = (attacker == 1 && (action.second.first == BOARD_H - 1 || action.second.first == 0));
 
-            if (p.use_lmr && depth >= p.lmr_depth_limit && move_index >= p.lmr_full_depth && !is_capture && !is_promotion) {
-                reduction = 1;
-                if (depth >= p.lmr_depth_limit + 3 && move_index >= p.lmr_full_depth + 5) {
-                    reduction = 2;
-                }
-            }
-
+            int reduction = get_lmr_reduction(depth, move_index, is_capture, is_promotion, false, p);
             int reduced_depth = std::max(0, depth - 1 - reduction);
 
             if(same){
@@ -563,18 +530,7 @@ SearchResult Submission::search(
     if(!ctx.stop && p.use_tt){
         g_prev_best_move = result.best_move;
         g_prev_hash = state->hash();
-
-        // Also store root node results in TT
-        if (!g_tt_array.empty()) {
-            size_t idx = state->hash() % g_tt_array.size();
-            TTEntry entry;
-            entry.hash = state->hash();
-            entry.score = best_score;
-            entry.depth = depth;
-            entry.best_move = result.best_move;
-            entry.flag = TT_EXACT;
-            g_tt_array[idx] = entry;
-        }
+        tt_store(state->hash(), depth, best_score, result.best_move, TT_EXACT);
     }
 
     result.score = best_score;
@@ -583,8 +539,7 @@ SearchResult Submission::search(
         result.pv.push_back(result.best_move);
     }
     return result;
-} 
-
+}
 
 /*============================================================
  * Submission — default_params / param_defs
